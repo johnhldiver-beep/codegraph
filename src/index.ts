@@ -64,7 +64,7 @@ import { EXTRACTION_VERSION } from './extraction/extraction-version';
 import { getCodeGraphDir } from './directory';
 import { deriveProjectNameTokens } from './search/query-utils';
 import ignore from 'ignore';
-import { loadDeprioritizePatterns } from './project-config';
+import { loadDeprioritizePatterns, loadMaxFileSize } from './project-config';
 import { CodeGraphPackageVersion } from './mcp/version';
 import { extractSegmentSearchWords, segmentLookupVariants, splitIdentifierSegments } from './search/identifier-segments';
 import { createYielder } from './resolution/cooperative-yield';
@@ -115,6 +115,9 @@ export interface InitOptions {
 
   /** Progress callback for indexing */
   onProgress?: (progress: IndexProgress) => void;
+
+  /** Largest file to index, in bytes (see {@link IndexOptions.maxFileSize}). */
+  maxFileSize?: number;
 }
 
 /**
@@ -140,6 +143,12 @@ export interface IndexOptions {
 
   /** Enable verbose logging (worker lifecycle, memory, timeouts) */
   verbose?: boolean;
+  /**
+   * Largest source file to index, in bytes. Files above it are recorded as
+   * skipped without being parsed. Overrides `codegraph.json` `maxFileSize` for
+   * this run; absent, that setting (or the built-in 1 MB) applies.
+   */
+  maxFileSize?: number;
   /** Watcher fast path: reconcile ONLY these project-relative paths (see ExtractionOrchestrator.sync). */
   paths?: string[];
 }
@@ -369,7 +378,7 @@ export class CodeGraph {
 
     // Run initial indexing if requested
     if (options.index) {
-      await instance.indexAll({ onProgress: options.onProgress });
+      await instance.indexAll({ onProgress: options.onProgress, maxFileSize: options.maxFileSize });
     }
 
     return instance;
@@ -567,6 +576,16 @@ export class CodeGraph {
     return this.projectRoot;
   }
 
+  /**
+   * The project's indexing size limit in bytes — `maxFileSize` from
+   * `codegraph.json`, or the built-in 1 MB. Surfaces that compare a file on
+   * disk against its stored content hash need it to know whether an oversize
+   * file was stored as a size stamp.
+   */
+  getMaxFileSize(): number {
+    return loadMaxFileSize(this.projectRoot);
+  }
+
   // ===========================================================================
   // Indexing
   // ===========================================================================
@@ -655,7 +674,8 @@ export class CodeGraph {
             // Store-writer offload is fresh-DB-only: with any pre-existing
             // data the store path must read (existing-file checks, cross-file
             // edge snapshots) and delete, which belongs on one thread.
-            freshDb ? { dbPath: this.db.getPath(), fastInit } : null
+            freshDb ? { dbPath: this.db.getPath(), fastInit } : null,
+            options.maxFileSize
           );
         } finally {
           if (freshDb) {
@@ -1030,7 +1050,8 @@ export class CodeGraph {
               refreshSynthesis = true;
               this.queries.setMetadata('synthesis_pending', '1');
             }
-          });
+          },
+          options.maxFileSize);
 
         // A component a tag in an unchanged file may render: `<Team />` links
         // to the `Team` this sync adds. The gate above reads each changed file

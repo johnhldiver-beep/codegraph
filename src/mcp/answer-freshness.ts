@@ -1,7 +1,7 @@
 import { createHash } from 'crypto';
 import { createReadStream } from 'fs';
 import { stat } from 'fs/promises';
-import { MAX_SOURCE_FILE_SIZE_BYTES, oversizeStamp } from '../file-limits';
+import { sizeStampHash } from '../file-limits';
 import { validatePathWithinRoot } from '../utils';
 
 export interface AnswerFile {
@@ -40,9 +40,10 @@ export async function validateAnswerFiles(root: string, files: AnswerFile[]): Pr
       // A file over the index's size limit is stored as its size stamp
       // (#1910): when the stamp still matches, the file is current without
       // being read. Anything else falls through to the bounded read below.
+      // The stamp is tried unconditionally so an index built with a custom
+      // `maxFileSize` is checked the same way.
       const { size } = await stat(absolute);
-      if (size > MAX_SOURCE_FILE_SIZE_BYTES &&
-          createHash('sha256').update(oversizeStamp(size)).digest('hex') === file.contentHash) {
+      if (sizeStampHash(size) === file.contentHash) {
         continue;
       }
       const stream = createReadStream(absolute, {

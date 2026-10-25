@@ -75,6 +75,7 @@ import { lookupSymbolNodes, describeSymbolNode, groupDefinitions } from '../grap
 import { goPackageReaderFor } from '../graph/go-package';
 import type { Node, Edge } from '../types';
 import { isTestPath } from '../search/query-utils';
+import { parseFileSize, formatFileSize } from '../file-limits';
 
 // Decided once, before `--color`/`--no-color` are stripped from argv below
 // (#1281). Piped/redirected stdout, NO_COLOR, or --no-color -> plain output.
@@ -415,9 +416,22 @@ type IndexResult = {
 /**
  * Print indexing results using clack log methods
  */
-function printIndexResult(clack: typeof import('@clack/prompts'), result: IndexResult, projectPath?: string): void {
+function printIndexResult(
+  clack: typeof import('@clack/prompts'),
+  result: IndexResult,
+  projectPath?: string,
+  maxFileSize?: number,
+): void {
   const hasErrors = result.filesErrored > 0;
   const parseWarnings = result.errors.filter((e) => e.code === 'parse_error' && e.severity === 'warning');
+  // Files skipped for exceeding the indexing size limit. These are warnings,
+  // not failures, so they never reach the error breakdown — surface the count
+  // here or a project quietly indexes less than the user expects.
+  const oversizeSkips = result.errors.filter((e) => e.code === 'size_exceeded').length;
+  const limitText = maxFileSize !== undefined ? ` (${formatFileSize(maxFileSize)})` : '';
+  const oversizeHint =
+    `Skipped ${formatNumber(oversizeSkips)} file(s) over the size limit${limitText} ${getGlyphs().dash} ` +
+    `raise "maxFileSize" in codegraph.json or pass --max-file-size to index them.`;
 
   // Surface non-file-level failures (e.g. lock-acquisition failure
   // when another indexer is running) before the file-count branches.
@@ -465,8 +479,11 @@ function printIndexResult(clack: typeof import('@clack/prompts'), result: IndexR
       const more = salvaged.length > 3 ? ', ...' : '';
       clack.log.warn(`${formatNumber(salvaged.length)} file(s) indexed from comment-stripped source after repeated parse failures ${getGlyphs().dash} symbols may be incomplete (${sample}${more})`);
     }
+    if (oversizeSkips > 0) clack.log.warn(oversizeHint);
   } else if (hasErrors) {
     clack.log.error(`Indexing failed ${getGlyphs().dash} all ${formatNumber(result.filesErrored)} files had errors`);
+  } else if (oversizeSkips > 0) {
+    clack.log.warn(`No files under the indexing size limit${limitText}. ${oversizeHint}`);
   } else if (result.filesSkippedUnsupported) {
     // A project CodeGraph has no grammar for used to be indistinguishable from
     // an empty one: same message, same `complete` state, same exit 0. Say which
@@ -547,7 +564,7 @@ async function offerIndexIgnoredRepos(
   clack: typeof import('@clack/prompts'),
   projectPath: string,
   reindex: () => Promise<IndexResult>,
-  opts: { interactive: boolean },
+  opts: { interactive: boolean; maxFileSize?: number },
 ): Promise<IndexResult | undefined> {
   let repos: string[];
   let patterns: string[];
@@ -605,7 +622,7 @@ async function offerIndexIgnoredRepos(
   clack.log.success(`Added ${formatNumber(added)} ${added === 1 ? 'entry' : 'entries'} to ${PROJECT_CONFIG_FILENAME} ${getGlyphs().dash} re-indexing…`);
 
   const result = await reindex();
-  printIndexResult(clack, result, projectPath);
+  printIndexResult(clack, result, projectPath, opts.maxFileSize);
   return result;
 }
 
@@ -682,9 +699,21 @@ async function recordIndexTelemetry(
  */
 async function runInit(
   projectPath: string,
-  options: { index?: boolean; force?: boolean; verbose?: boolean; yes?: boolean },
+  options: { index?: boolean; force?: boolean; verbose?: boolean; yes?: boolean; maxFileSize?: string },
 ): Promise<void> {
   const clack = await importESM('@clack/prompts');
+
+  let maxFileSize: number | undefined;
+  if (options.maxFileSize !== undefined) {
+    try {
+      maxFileSize = parseFileSize(options.maxFileSize);
+    } catch (err) {
+      clack.log.error(err instanceof Error ? err.message : String(err));
+      clack.outro('');
+      process.exitCode = 1;
+      return;
+    }
+  }
 
   clack.intro('Initializing CodeGraph');
 
@@ -749,19 +778,20 @@ async function runInit(
       const supervision = installCommandSupervision('init', { progressPaths: [dbPath, `${dbPath}-wal`] });
       try {
         if (options.verbose) {
-          return await cg.indexAll({ onProgress: createVerboseProgress(), verbose: true });
+          return await cg.indexAll({ onProgress: createVerboseProgress(), verbose: true, maxFileSize });
         }
         process.stdout.write(`${colors.dim}${getGlyphs().rail}${colors.reset}\n`);
         const progress = createShimmerProgress();
-        const r = await cg.indexAll({ onProgress: progress.onProgress });
+        const r = await cg.indexAll({ onProgress: progress.onProgress, maxFileSize });
         await progress.stop();
         return r;
       } finally {
         supervision.stop();
       }
     };
+    const limit = maxFileSize ?? cg.getMaxFileSize();
     const result = await runIndex();
-    printIndexResult(clack, result, projectPath);
+    printIndexResult(clack, result, projectPath, limit);
     await recordIndexTelemetry(cg, result);
 
     // An empty graph at a git super-repo usually means `.gitignore` excludes
@@ -770,7 +800,7 @@ async function runInit(
     // Under --yes the offer prints its one-line opt-in snippet instead of
     // prompting (same as a non-TTY run).
     if (result.nodesCreated === 0) {
-      await offerIndexIgnoredRepos(clack, projectPath, runIndex, { interactive: !options.yes });
+      await offerIndexIgnoredRepos(clack, projectPath, runIndex, { interactive: !options.yes, maxFileSize: limit });
     }
 
     try {
@@ -796,7 +826,8 @@ program
   .option('-f, --force', 'Initialize even if the path looks like your home directory or a filesystem root')
   .option('-v, --verbose', 'Show detailed worker lifecycle and memory info')
   .option('-y, --yes', 'Non-interactive: skip every prompt and take the defaults (for scripts / CI / container bootstraps)')
-  .action(async (pathArg: string | undefined, options: { index?: boolean; force?: boolean; verbose?: boolean; yes?: boolean }) => {
+  .option('--max-file-size <size>', 'Skip source files larger than this when indexing (e.g. 500kb, 2mb, 1gb; default: 1mb, or the maxFileSize in codegraph.json)')
+  .action(async (pathArg: string | undefined, options: { index?: boolean; force?: boolean; verbose?: boolean; yes?: boolean; maxFileSize?: string }) => {
     await runInit(path.resolve(pathArg || process.cwd()), options);
   });
 
@@ -870,7 +901,8 @@ program
   .option('-f, --force', 'Index even if the path looks like your home directory or a filesystem root')
   .option('-q, --quiet', 'Suppress progress output')
   .option('-v, --verbose', 'Show detailed worker lifecycle and memory info')
-  .action(async (pathArg: string | undefined, options: { force?: boolean; quiet?: boolean; verbose?: boolean }) => {
+  .option('--max-file-size <size>', 'Skip source files larger than this when indexing (e.g. 500kb, 2mb, 1gb; default: 1mb, or the maxFileSize in codegraph.json)')
+  .action(async (pathArg: string | undefined, options: { force?: boolean; quiet?: boolean; verbose?: boolean; maxFileSize?: string }) => {
     // An EXPLICIT path names the project to rebuild — it is never a hint to go
     // looking for one. resolveProjectPath walks up to the nearest initialized
     // ancestor, which is right for `codegraph query` run from a subdirectory,
@@ -878,6 +910,15 @@ program
     // normal "Done" when <path> had no index of its own (#1524). Only a bare
     // `codegraph index` (cwd) may resolve upward.
     const projectPath = pathArg ? path.resolve(pathArg) : resolveProjectPath();
+    let maxFileSize: number | undefined;
+    if (options.maxFileSize !== undefined) {
+      try {
+        maxFileSize = parseFileSize(options.maxFileSize);
+      } catch (err) {
+        error(err instanceof Error ? err.message : String(err));
+        process.exit(1);
+      }
+    }
 
     try {
       // Don't (re)index your home directory / a filesystem root (#845). --force
@@ -937,9 +978,10 @@ program
           const dbPath = getDatabasePath(projectPath);
           const supervision = installCommandSupervision('index', { progressPaths: [dbPath, `${dbPath}-wal`] });
           try {
+            const limit = maxFileSize ?? cg.getMaxFileSize();
             if (options.quiet) {
               // Quiet mode: no UI, just run against the freshly-recreated graph.
-              const result = await cg.indexAll();
+              const result = await cg.indexAll({ maxFileSize });
               if (!result.success) process.exit(1);
               return;
             }
@@ -951,25 +993,25 @@ program
             // renders identically. Supervision already wraps the whole command.
             const renderIndex = async (): Promise<IndexResult> => {
               if (options.verbose) {
-                return await cg.indexAll({ onProgress: createVerboseProgress(), verbose: true });
+                return await cg.indexAll({ onProgress: createVerboseProgress(), verbose: true, maxFileSize });
               }
               process.stdout.write(`${colors.dim}${getGlyphs().rail}${colors.reset}\n`);
               const progress = createShimmerProgress();
-              const r = await cg.indexAll({ onProgress: progress.onProgress });
+              const r = await cg.indexAll({ onProgress: progress.onProgress, maxFileSize });
               await progress.stop();
               return r;
             };
 
             const result = await renderIndex();
 
-            printIndexResult(clack, result, projectPath);
+            printIndexResult(clack, result, projectPath, limit);
             await recordIndexTelemetry(cg, result);
 
             // Empty graph at a git super-repo → likely `.gitignore`d child repos;
             // name them and offer to opt in instead of a silent 0-node result (#1156).
             let finalResult = result;
             if (result.nodesCreated === 0) {
-              finalResult = (await offerIndexIgnoredRepos(clack, projectPath, renderIndex, { interactive: true })) ?? result;
+              finalResult = (await offerIndexIgnoredRepos(clack, projectPath, renderIndex, { interactive: true, maxFileSize: limit })) ?? result;
             }
 
             if (!finalResult.success) {

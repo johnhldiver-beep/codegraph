@@ -9,7 +9,25 @@ Next to none — CodeGraph is **zero-config by default**, with nothing to write 
 
 - **Dependency, build, and cache directories** — `node_modules`, `vendor`, `dist`, `build`, `target`, `.venv`, `Pods`, `.next`, and the like across every [supported stack](/codegraph/reference/languages/) — so the graph is your code, not third-party noise. This holds even with no `.gitignore`. A `build` folder inside `src/` is the exception: no build step writes TypeScript, JSX, Vue, Svelte, Astro, Go, C# or Rust files into one, so those are indexed from it, and a Java, Kotlin or Scala package named `build` is indexed whole.
 - **Anything in your `.gitignore`** — honored in git repos via git, and in non-git projects by reading `.gitignore` directly (root and nested).
-- **Files larger than 1 MB** — generated bundles, minified JS, vendored blobs.
+- **Files larger than 1 MB** — generated bundles, minified JS, vendored blobs. Raise or lower the limit with [`maxFileSize`](#file-size-limit).
+
+## File size limit
+
+CodeGraph skips files above 1 MB by default, because generated bundles, minified sources, and committed blobs have no useful symbols. Change the ceiling with `maxFileSize` in `codegraph.json`, as a size (`500kb`, `2mb`, `1gb`; binary units) or a number of bytes:
+
+```json
+{
+  "maxFileSize": "2mb"
+}
+```
+
+For a one-off run, pass `--max-file-size` to `codegraph init` or `codegraph index`:
+
+```bash
+codegraph index --max-file-size 500kb
+```
+
+The flag applies to that run only; the config setting also governs `sync` and file-watching. Skipped files are reported in the index summary. An invalid flag value is an error; an invalid config value is warned about and ignored. Re-index after changing the setting.
 
 ## Excluding or including more
 

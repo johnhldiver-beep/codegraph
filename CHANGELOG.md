@@ -12,6 +12,10 @@ and adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### New Features
+
+- The size limit for indexed files is now configurable. `codegraph init --max-file-size 2mb` (or the same flag on `codegraph index`) sets it for one run, accepting sizes like `500kb`, `2mb` and `1gb`, and a `"maxFileSize"` entry in `codegraph.json` makes it stick across syncs and the file watcher. The default is unchanged at 1 MB, and files skipped for their size are now counted in the index summary instead of disappearing silently. (#369)
+
 ### Fixes
 
 - In TypeScript, an awaited call with type arguments like `await fetchApi<User>("/me")` or `await api.get<T>(url)` now links to the function it calls. Before, the call was dropped, so typed fetch wrappers looked like they had no callers. (#2586)

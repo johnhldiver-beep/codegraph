@@ -25,7 +25,7 @@ import { StoreWriter, StoreBundle, finalizeStoreBundle } from './store-writer';
 import { materializeKernelResult } from './kernel';
 import { detectGeneratedFile } from './generated-detection';
 import { detectLanguage, isSourceFile, isLanguageSupported, isFileLevelOnlyLanguage, initGrammars, loadGrammarsForLanguages, readGrammarWasmBytes, isMpegTransportStream, hasMpegTsExtension, MPEG_TS_SNIFF_BYTES, hasGrammarLoadFailure } from './grammars';
-import { loadExtensionOverrides, loadIncludeIgnoredPatterns, loadExcludePatterns, loadIncludePatterns, PROJECT_CONFIG_FILENAME } from '../project-config';
+import { loadExtensionOverrides, loadIncludeIgnoredPatterns, loadExcludePatterns, loadIncludePatterns, resolveMaxFileSize, PROJECT_CONFIG_FILENAME } from '../project-config';
 import { isCodeGraphDataDir } from '../directory';
 import { logDebug, logWarn } from '../errors';
 import { validatePathWithinRoot, normalizePath } from '../utils';
@@ -36,7 +36,7 @@ import type { ResolutionContext } from '../resolution/types';
 import { createYielder, type MaybeYield } from '../resolution/cooperative-yield';
 import { resurrectRefFromDroppedEdge } from '../resolution/resurrect-ref';
 import { createImportReader, reopenReferencesThroughRemovedFiles } from '../resolution/module-importers';
-import { MAX_SOURCE_FILE_SIZE_BYTES, oversizeStamp, readBoundedSource, readBoundedSourceSync } from '../file-limits';
+import { oversizeStamp, readBoundedSource, readBoundedSourceSync } from '../file-limits';
 export { oversizeStamp };
 
 /**
@@ -184,8 +184,8 @@ export function hashContent(content: string): string {
  * and runs only for a file that is new or changed — never once per `.ts` file
  * at discovery, which on a slow disk is a random read per file per scan.
  */
-function readSourceOrStamp(fullPath: string): string | null {
-  const { stats, bytes } = readBoundedSourceSync(fullPath);
+function readSourceOrStamp(fullPath: string, maxBytes: number): string | null {
+  const { stats, bytes } = readBoundedSourceSync(fullPath, maxBytes);
   if (bytes === null) return oversizeStamp(stats.size);
   return isMpegTsBytes(fullPath, bytes) ? null : bytes.toString('utf8');
 }
@@ -2192,12 +2192,17 @@ export class ExtractionOrchestrator {
     // passed for a COMPLETELY fresh database, where the main thread performs
     // no reads/writes during the parse loop, so one writer applying bundles
     // in file order preserves the #1015 determinism exactly.
-    storeWriterOpts?: { dbPath: string; fastInit: boolean } | null
+    storeWriterOpts?: { dbPath: string; fastInit: boolean } | null,
+    /** Largest file to index, in bytes. Overrides `codegraph.json` `maxFileSize`. */
+    maxFileSize?: number
   ): Promise<IndexResult> {
     const tGrammar = Date.now();
     await initGrammars();
     if (process.env.CODEGRAPH_SYNTH_TIMINGS) console.error(`[phase-timing] grammar-init: ${Date.now() - tGrammar}ms`);
     const startTime = Date.now();
+    // One resolution for the whole run: the batch reader, the size gate, and
+    // the retry re-reads must all agree on the same ceiling.
+    const maxBytes = resolveMaxFileSize(this.rootDir, maxFileSize);
     const errors: ExtractionError[] = [];
     let filesIndexed = 0;
     let filesSkipped = 0;
@@ -2566,7 +2571,7 @@ export class ExtractionOrchestrator {
             // Stat first: a file over the size limit is stored as skipped
             // without ever being read or decoded (#1910), so ten oversize
             // fixtures in one I/O batch no longer cost their size in RSS.
-            const { stats, bytes } = await readBoundedSource(fullPath);
+            const { stats, bytes } = await readBoundedSource(fullPath, maxBytes);
             if (bytes === null) {
               return { filePath: fp, content: oversizeStamp(stats.size), stats, error: null as Error | null };
             }
@@ -2609,18 +2614,18 @@ export class ExtractionOrchestrator {
           continue;
         }
 
-        // Honour MAX_SOURCE_FILE_SIZE_BYTES. Without this check, vendored generated
+        // Honour the indexing size limit. Without this check, vendored generated
         // headers, minified bundles, and other multi-MB files get indexed,
         // wasting WASM heap and the worker recycle budget on inputs with no
         // useful symbols. The single-file extractFile path already enforces
         // this; the bulk path used to silently skip the check.
-        if (stats.size > MAX_SOURCE_FILE_SIZE_BYTES) {
+        if (stats.size > maxBytes) {
           await storeResult(filePath, content, stats, {
             nodes: [],
             edges: [],
             unresolvedReferences: [],
             errors: [{
-              message: `File exceeds max size (${stats.size} > ${MAX_SOURCE_FILE_SIZE_BYTES})`,
+              message: `File exceeds max size (${stats.size} > ${maxBytes})`,
               filePath,
               severity: 'warning',
               code: 'size_exceeded',
@@ -2724,7 +2729,7 @@ export class ExtractionOrchestrator {
           const fullPath = validatePathWithinRoot(this.rootDir, filePath);
           if (!fullPath) continue;
           // Bounded like the first read: the file may have grown since (#1910).
-          const bytes = (await readBoundedSource(fullPath)).bytes;
+          const bytes = (await readBoundedSource(fullPath, maxBytes)).bytes;
           if (bytes === null) continue;
           content = bytes.toString('utf8');
         } catch {
@@ -2778,7 +2783,7 @@ export class ExtractionOrchestrator {
           try {
             const fullPath = validatePathWithinRoot(this.rootDir, filePath);
             if (!fullPath) continue;
-            const bytes = (await readBoundedSource(fullPath)).bytes;
+            const bytes = (await readBoundedSource(fullPath, maxBytes)).bytes;
             if (bytes === null) continue;
             fullContent = bytes.toString('utf8');
           } catch {
@@ -2853,9 +2858,10 @@ export class ExtractionOrchestrator {
     let filesErrored = 0;
     let totalNodes = 0;
     let totalEdges = 0;
+    const maxBytes = resolveMaxFileSize(this.rootDir);
 
     for (const filePath of filePaths) {
-      const result = await this.indexFile(filePath);
+      const result = await this.indexFile(filePath, maxBytes);
 
       if (result.errors.length > 0) {
         errors.push(...result.errors);
@@ -2894,9 +2900,10 @@ export class ExtractionOrchestrator {
   /**
    * Index a single file
    */
-  async indexFile(relativePath: string): Promise<ExtractionResult> {
+  async indexFile(relativePath: string, maxFileSize?: number): Promise<ExtractionResult> {
     // Indexing read: follow in-root symlinks (the `../` guard still applies), #935.
     const fullPath = validatePathWithinRoot(this.rootDir, relativePath, { allowSymlinkEscape: true });
+    const maxBytes = maxFileSize ?? resolveMaxFileSize(this.rootDir);
 
     if (!fullPath) {
       return {
@@ -2913,7 +2920,7 @@ export class ExtractionOrchestrator {
     let stats: fs.Stats;
     try {
       // An oversize file is stored as skipped; its bytes are never needed (#1910).
-      const read = await readBoundedSource(fullPath);
+      const read = await readBoundedSource(fullPath, maxBytes);
       stats = read.stats;
       // An MPEG transport stream named `.ts` is not TypeScript (#1910).
       if (read.bytes !== null && isMpegTsBytes(relativePath, read.bytes)) {
@@ -2937,7 +2944,7 @@ export class ExtractionOrchestrator {
       };
     }
 
-    return this.indexFileWithContent(relativePath, content, stats);
+    return this.indexFileWithContent(relativePath, content, stats, maxBytes);
   }
 
   /**
@@ -2947,7 +2954,8 @@ export class ExtractionOrchestrator {
   async indexFileWithContent(
     relativePath: string,
     content: string,
-    stats: fs.Stats
+    stats: fs.Stats,
+    maxFileSize?: number
   ): Promise<ExtractionResult> {
     // Prevent `../` traversal; follow in-root symlinks like the directory walk (#935).
     const fullPath = validatePathWithinRoot(this.rootDir, relativePath, { allowSymlinkEscape: true });
@@ -2965,14 +2973,15 @@ export class ExtractionOrchestrator {
     const language = detectLanguage(relativePath, content, loadExtensionOverrides(this.rootDir), this.rootDir);
 
     // Check file size
-    if (stats.size > MAX_SOURCE_FILE_SIZE_BYTES) {
+    const maxBytes = maxFileSize ?? resolveMaxFileSize(this.rootDir);
+    if (stats.size > maxBytes) {
       const result: ExtractionResult = {
         nodes: [],
         edges: [],
         unresolvedReferences: [],
         errors: [
           {
-            message: `File exceeds max size (${stats.size} > ${MAX_SOURCE_FILE_SIZE_BYTES})`,
+            message: `File exceeds max size (${stats.size} > ${maxBytes})`,
             filePath: relativePath,
             severity: 'warning',
             code: 'size_exceeded',
@@ -3524,10 +3533,16 @@ export class ExtractionOrchestrator {
      */
     backpressure?: () => Promise<void> | null,
     /** Inspect changed inputs before deletion/re-extraction cascades their edges. */
-    onFileChange?: (filePath: string, content?: string) => void
+    onFileChange?: (filePath: string, content?: string) => void,
+    /** Largest file to index, in bytes. Overrides `codegraph.json` `maxFileSize`. */
+    maxFileSize?: number
   ): Promise<SyncResult> {
     await initGrammars(); // Initialize WASM runtime (grammars loaded lazily below)
     const startTime = Date.now();
+    // Same ceiling for change detection and re-extraction: a file's stored
+    // hash is a size stamp when it was indexed as oversize, so reading it under
+    // a different limit would make every sync call it modified forever.
+    const maxBytes = resolveMaxFileSize(this.rootDir, maxFileSize);
     let filesChecked = 0;
     let filesAdded = 0;
     let filesModified = 0;
@@ -3712,7 +3727,7 @@ export class ExtractionOrchestrator {
       // (An oversize file hashes as its size stamp, unread — #1910.)
       let content: string | null;
       try {
-        content = readSourceOrStamp(fullPath);
+        content = readSourceOrStamp(fullPath, maxBytes);
       } catch (error) {
         logDebug('Skipping unreadable file during sync', { filePath, error: String(error) });
         failedFilePaths.push(filePath);
@@ -3768,7 +3783,7 @@ export class ExtractionOrchestrator {
         currentFile: filePath,
       });
 
-      const result = await this.indexFile(filePath);
+      const result = await this.indexFile(filePath, maxBytes);
       if (result.errors.some(e => e.severity === 'error')) failedFilePaths.push(filePath);
       if (!hasGrammarLoadFailure(result.errors)) nodesUpdated += result.nodes.length; // else nothing was stored (#2335)
 
@@ -3856,6 +3871,9 @@ export class ExtractionOrchestrator {
    * Uses git status as a fast path when available, falling back to full scan.
    */
   getChangedFiles(): { added: string[]; modified: string[]; removed: string[] } {
+    // Change detection must read under the same limit the index used, or an
+    // oversize file's size-stamp hash never matches and it reads as modified.
+    const maxBytes = resolveMaxFileSize(this.rootDir);
     // The commit this index was last brought up to date at. Absent on an index
     // built before stamping existed — getGitChangedFiles then declines the fast
     // path and the full scan below answers correctly, once, until a sync or a
@@ -3887,7 +3905,7 @@ export class ExtractionOrchestrator {
           continue;
         }
         let content: string | null;
-        try { content = readSourceOrStamp(fullPath); }
+        try { content = readSourceOrStamp(fullPath, maxBytes); }
         catch (error) {
           logDebug('Skipping unreadable file while detecting changes', { filePath, error: String(error) });
           continue;
@@ -3931,7 +3949,7 @@ export class ExtractionOrchestrator {
       const fullPath = path.join(this.rootDir, filePath);
       let content: string | null;
       try {
-        content = readSourceOrStamp(fullPath);
+        content = readSourceOrStamp(fullPath, maxBytes);
       } catch (error) {
         logDebug('Skipping unreadable file while detecting changes', { filePath, error: String(error) });
         continue;

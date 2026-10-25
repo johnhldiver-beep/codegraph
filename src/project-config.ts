@@ -27,6 +27,7 @@ import * as path from 'path';
 import { Language } from './types';
 import { isLanguageSupported } from './extraction/grammars';
 import { logWarn } from './errors';
+import { MAX_SOURCE_FILE_SIZE_BYTES, parseFileSize } from './file-limits';
 
 /** Filename of the project-scoped config, resolved relative to the project root. */
 export const PROJECT_CONFIG_FILENAME = 'codegraph.json';
@@ -82,6 +83,15 @@ export interface ProjectConfig {
    * beyond the built-ins.
    */
   deprioritize?: string[];
+  /**
+   * Largest source file to index, as a byte count or a human-readable size
+   * (`"500kb"`, `"2mb"`, `"1gb"`; a bare number means bytes). Files over it
+   * are recorded as skipped without being parsed. Absent (the default) keeps
+   * the built-in 1 MB ceiling. `--max-file-size` overrides it for one
+   * `init`/`index` run; set it here to make it stick across syncs and the
+   * watcher. A malformed value is warned about and ignored, never fatal.
+   */
+  maxFileSize?: string | number;
 }
 
 /** Parsed, validated view of a project's `codegraph.json`. */
@@ -91,6 +101,7 @@ interface ParsedConfig {
   exclude: string[];
   deprioritize: string[];
   include: string[];
+  maxFileSize: number;
 }
 
 interface CacheEntry {
@@ -114,6 +125,7 @@ const EMPTY_CONFIG: ParsedConfig = Object.freeze({
   exclude: Object.freeze([]) as unknown as string[],
   include: Object.freeze([]) as unknown as string[],
   deprioritize: Object.freeze([]) as unknown as string[],
+  maxFileSize: MAX_SOURCE_FILE_SIZE_BYTES,
 });
 
 /**
@@ -167,16 +179,18 @@ function parseConfig(file: string): ParsedConfig {
   const exclude = extractExclude(parsed, file);
   const include = extractInclude(parsed, file);
   const deprioritize = extractPatternList(parsed, file, 'deprioritize');
+  const maxFileSize = extractMaxFileSize(parsed, file);
   if (
     extensions === EMPTY_EXTENSIONS &&
     includeIgnored.length === 0 &&
     exclude.length === 0 &&
     include.length === 0 &&
-    deprioritize.length === 0
+    deprioritize.length === 0 &&
+    maxFileSize === MAX_SOURCE_FILE_SIZE_BYTES
   ) {
     return EMPTY_CONFIG;
   }
-  return { extensions, includeIgnored, exclude, include, deprioritize };
+  return { extensions, includeIgnored, exclude, include, deprioritize, maxFileSize };
 }
 
 /**
@@ -307,6 +321,26 @@ function extractInclude(parsed: object, file: string): string[] {
 }
 
 /**
+ * Validate `maxFileSize`: a byte count or a human-readable size (see
+ * {@link parseFileSize}). An absent value keeps the built-in limit; a malformed
+ * one warns and is ignored, so a typo can never make indexing throw.
+ */
+function extractMaxFileSize(parsed: object, file: string): number {
+  const raw = (parsed as ProjectConfig).maxFileSize;
+  if (raw === undefined) return MAX_SOURCE_FILE_SIZE_BYTES;
+  if (typeof raw !== 'string' && typeof raw !== 'number') {
+    logWarn(`Ignoring "maxFileSize" in ${PROJECT_CONFIG_FILENAME}: must be a size like "2mb" or a number of bytes`, { file });
+    return MAX_SOURCE_FILE_SIZE_BYTES;
+  }
+  try {
+    return parseFileSize(raw);
+  } catch (err) {
+    logWarn(`Ignoring "maxFileSize" in ${PROJECT_CONFIG_FILENAME}: ${err instanceof Error ? err.message : String(err)}`, { file });
+    return MAX_SOURCE_FILE_SIZE_BYTES;
+  }
+}
+
+/**
  * Load the parsed `codegraph.json` for a project, mtime-cached. A missing or
  * malformed file yields the zero-config default. One `stat` (and at most one
  * read/parse) while a single config file is in force, shared across every field.
@@ -389,6 +423,24 @@ export function loadDeprioritizePatterns(rootDir: string): string[] {
  */
 export function loadIncludePatterns(rootDir: string): string[] {
   return loadParsedConfig(rootDir).include;
+}
+
+/**
+ * Load the project's indexing size limit in bytes, mtime-cached. Defaults to
+ * {@link MAX_SOURCE_FILE_SIZE_BYTES} when there is no `codegraph.json` or it
+ * carries no valid `maxFileSize`.
+ */
+export function loadMaxFileSize(rootDir: string): number {
+  return loadParsedConfig(rootDir).maxFileSize;
+}
+
+/**
+ * The size limit an indexing run should enforce: an explicit override (the
+ * `--max-file-size` flag or an `IndexOptions` value) wins for that run, then
+ * the project's `maxFileSize`, then the built-in 1 MB.
+ */
+export function resolveMaxFileSize(rootDir: string, override?: number): number {
+  return override ?? loadMaxFileSize(rootDir);
 }
 
 /** Test/maintenance hook: forget cached config (e.g. after rewriting it in a test). */
