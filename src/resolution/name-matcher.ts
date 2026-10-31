@@ -30630,7 +30630,15 @@ export function retargetSelfOverload(result: ResolvedRef, ref: UnresolvedRef, co
   const argc = args.trim() === '' ? 0 : splitCppTopLevel(args).length;
   if (argc >= set.own.min && argc <= set.own.max) return result;
   const fits = set.siblings.filter((s) => s.arity !== null && argc >= s.arity.min && argc <= s.arity.max);
-  return fits.length === 1 ? { ...result, targetNodeId: fits[0]!.id } : result;
+  if (fits.length === 1) return { ...result, targetNodeId: fits[0]!.id };
+  // Java: when several overloads take the call's argument count, the count
+  // has still ruled the settled one out — it cannot be what the call means —
+  // and the first declared of those that fit is the reading (#3040): jsoup's
+  // `Jsoup.parse(File, String, String, Parser)` is
+  // `DataUtil.load(File, String, String, Parser)`, not the 3-parameter `load`
+  // the first-declared pick gave.
+  if (ref.language === 'java' && fits.length > 1) return { ...result, targetNodeId: fits[0]!.id };
+  return result;
 }
 
 /**
